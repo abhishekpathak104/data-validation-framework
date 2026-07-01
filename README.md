@@ -18,6 +18,7 @@ A GCP-native data validation framework built on **Apache Spark (Dataproc)** and 
 - [Validation Rule Types](#validation-rule-types)
 - [Output Tables](#output-tables)
 - [Notification Setup](#notification-setup)
+- [AI-Assisted Rule Generation](#ai-assisted-rule-generation)
 - [Contributing](#contributing)
 
 ---
@@ -399,6 +400,61 @@ Email alerts are sent when the failure rate for a rule exceeds its configured cr
    - `data_validation_notification_distribution_list`
    - `data_validation_notification_message_handler`
    - `data_validation_object_notification`
+
+---
+
+## AI-Assisted Rule Generation
+
+`data_validation/rule_intelligence/` is an optional, local CLI tool (never run on Dataproc) that uses
+Gemini via LangChain to propose candidate validation rules from a sample data file and/or a freeform
+data-contract document, subject to human review before anything is written to the metadata database.
+
+Install the extra dependencies:
+
+```bash
+pip install -e ".[rule-intelligence]"
+export GOOGLE_API_KEY=<your Gemini API key from https://aistudio.google.com/apikey>
+```
+
+**1. Generate candidate rules** from a sample CSV/JSON file and (optionally) a data-contract document:
+
+```bash
+dv-rules-generate \
+    --sample-file samples/accounts.csv \
+    --contract contracts/accounts_contract.md \
+    --object-name account \
+    --object-database-name salesforce \
+    --out review/account_rules.yaml
+```
+
+This profiles the sample data with pandas, sends the profile (and contract text, if given) to Gemini,
+and writes a `review/account_rules.yaml` file — one entry per proposed rule, each with `include: true`,
+a `rule_logic` mapping, a confidence score, and a rationale.
+
+**2. Review the YAML by hand.** Toggle `include: false` to reject a rule, edit `rule_description` or
+`rule_logic`, or delete entries outright. Nothing is written to the database until step 3.
+
+**3. Apply the reviewed rules** to the MySQL metadata tables:
+
+```bash
+dv-rules-apply --review-file review/account_rules.yaml --conf config/data_validation.conf
+```
+
+This writes (in FK order) `data_validation_object_lookup` → `data_validation_rule` →
+`data_validation_rule_mapping` → `data_validation_rule_threshold`, inside a single transaction, and
+skips rule mappings that already exist (re-running `apply` on the same file is safe; pass `--force` to
+bypass this). Use `--dry-run` to preview the planned inserts without connecting to the database.
+
+Notes:
+- The LLM can only propose rules from the existing `Rule_Logic` vocabulary (`is_nullable`, `distinct`,
+  `regex`, `allowed`, `forbidden`, `min`, `max`, `min_length`, `max_length`, `min_date`, `max_date`,
+  `data_type`, `custom_sql`, or a business SQL statement). It can never generate a `custom_spark`
+  rule — that type is not a valid value in the underlying schema, so it cannot be produced even via a
+  maliciously-crafted contract document.
+- Business rules (raw SQL) are not syntax-checked against BigQuery by this tool — review them more
+  carefully than custodial rules, since errors only surface at actual validation run time.
+- This subpackage has no import-time dependency on `pyspark`/BigQuery; it's independent of the
+  Dataproc job's runtime requirements.
 
 ---
 

@@ -43,6 +43,13 @@ gcloud functions deploy hello_gcs \
 mysql -h $HOST -u root -p < sql/ddl/00_create_database.sql
 mysql -h $HOST -u root -p Data_Validation < sql/ddl/01_create_tables.sql
 mysql -h $HOST -u root -p Data_Validation < sql/dml/01_seed_rules.sql   # + 02..05, optional sample data
+
+# AI-assisted rule generation (local CLI, optional — see rule_intelligence architecture note below)
+pip install -e ".[rule-intelligence]"
+export GOOGLE_API_KEY=<gemini_api_key>
+dv-rules-generate --sample-file samples/accounts.csv --object-name account \
+    --object-database-name salesforce --out review/account_rules.yaml
+dv-rules-apply --review-file review/account_rules.yaml --conf config/data_validation.conf
 ```
 
 There is no single-test-runner command since no tests exist yet. If you add tests, they should be
@@ -107,3 +114,16 @@ prefer that (or Secret Manager) over putting a real password in the conf file.
 **`custom_spark` rules are disabled by default** (`validators/custodial.py`) because they `exec()`
 arbitrary Python sourced from the `Rule_Logic` column. Set `ALLOW_CUSTOM_SPARK_EXEC=1` only if the
 MySQL metadata database is trusted/access-controlled; prefer `custom_sql` otherwise.
+
+**`rule_intelligence/` — LLM-assisted rule authoring** is a separate, optional, locally-run CLI tool
+(installed via the `rule-intelligence` extra) with zero import-time dependency on pyspark/BigQuery —
+it never runs on Dataproc. Two commands: `dv-rules-generate` profiles a sample data file (pandas) and
+an optional freeform data-contract document, sends both to Gemini via `langchain-google-genai`
+(Google AI Studio `GOOGLE_API_KEY`, not Vertex AI) using `.with_structured_output()` against the
+Pydantic schema in `rule_intelligence/schema.py`, and writes a YAML file of candidate rules for a
+human to review by hand (toggle `include`, edit `rule_logic`). `dv-rules-apply` then reads the
+reviewed YAML and writes into the metadata tables in FK order — `object_lookup` → `rule` →
+`rule_mapping` → `rule_threshold` — inside one transaction, using the same `%s`-parameterized-query
+convention as `main.py`, with duplicate-mapping detection so re-running `apply` is safe. The
+`CustodialRuleType` enum in `schema.py` has no `custom_spark` member, so the LLM cannot emit an
+exec()-based rule under any circumstances, including prompt injection via a contract document.

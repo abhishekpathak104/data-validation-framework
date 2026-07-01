@@ -12,3 +12,6 @@ config/data_validation.conf
 data_validation.zip
 validation_errors.csv
 .DS_Store
+
+# Local Claude Code settings (machine-specific, not project config)
+.claude/
