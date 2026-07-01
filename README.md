@@ -1,15 +1,23 @@
 # Data Validation Framework
 
-A GCP-native data validation framework built on **Apache Spark (Dataproc)** and **BigQuery**. It enforces configurable business and custodial rules against data stored in BigQuery tables, Cloud SQL (MySQL), and GCS files, then reports failures with criticality scores and email notifications.
+A GCP-native data validation framework built on **Apache Spark (Dataproc)** and **BigQuery**. It
+enforces configurable business and custodial rules against data in BigQuery tables, Cloud SQL
+(MySQL), and GCS files, and reports failures with criticality scores and email alerts.
 
----
+> **✨ New: AI-assisted rule generation.** Point the bundled `dv-rules-generate` CLI at a sample of
+> your data and/or a data contract document, and **Gemini** (via **LangChain**) will draft candidate
+> validation rules for you — nullability, uniqueness, ranges, regexes, and more — ready for a human
+> to review and approve before anything touches the metadata database. Turns hours of manual rule
+> authoring into a five-minute review. See [AI-Assisted Rule Generation](#ai-assisted-rule-generation).
 
 ## Table of Contents
 
 - [Overview](#overview)
+- [Key Features](#key-features)
 - [Architecture](#architecture)
 - [Project Structure](#project-structure)
 - [Prerequisites](#prerequisites)
+- [Quick Start](#quick-start)
 - [Configuration](#configuration)
 - [Environment Variables](#environment-variables)
 - [Database Setup](#database-setup)
@@ -19,13 +27,17 @@ A GCP-native data validation framework built on **Apache Spark (Dataproc)** and 
 - [Output Tables](#output-tables)
 - [Notification Setup](#notification-setup)
 - [AI-Assisted Rule Generation](#ai-assisted-rule-generation)
+- [Security Considerations](#security-considerations)
 - [Contributing](#contributing)
+- [License](#license)
 
 ---
 
 ## Overview
 
-The framework reads validation rules from a MySQL metadata database, applies them to source data using Spark, and writes three categories of output to BigQuery:
+Validation rules and the objects they apply to are registered in a MySQL metadata database. A
+Dataproc/PySpark job reads that metadata, loads the relevant data, evaluates each rule, and writes
+three categories of output back to BigQuery:
 
 | Output | Description |
 |---|---|
@@ -33,7 +45,30 @@ The framework reads validation rules from a MySQL metadata database, applies the
 | **Aggregated errors** | Failure count, failure %, and criticality per rule per run |
 | **Object log** | Execution log entry per validated object per run |
 
-Failures above a configured threshold trigger email alerts via SendGrid.
+Failures above a configured threshold trigger email alerts via SendGrid. An optional, separate CLI
+tool (`rule_intelligence/`) can propose new rules for a human to review before they're added to the
+metadata database, using Gemini to read a sample of the data and/or a data contract document.
+
+## Key Features
+
+- 🤖 **AI-assisted rule authoring (Gemini + LangChain)** — generate candidate validation rules
+  automatically from a sample data file and/or a freeform data contract document, instead of
+  hand-writing every rule. Every suggestion is written to a human-readable YAML file for review and
+  approval before it's applied — the LLM never writes to the database directly, and it is structurally
+  incapable of proposing the dangerous `exec()`-based rule type. See
+  [AI-Assisted Rule Generation](#ai-assisted-rule-generation).
+- **Three data sources, one rule engine** — validate BigQuery tables, Cloud SQL (MySQL) tables, and
+  GCS files (CSV/JSON/XML) through the same metadata-driven pipeline.
+- **Two rule execution strategies** — *business* rules are raw SQL pushed straight to BigQuery;
+  *custodial* rules (nullability, uniqueness, regex, ranges, type checks, allow/deny lists, and more)
+  run as Spark transformations against the loaded data.
+- **Criticality-tiered alerting** — failure rate is compared against per-rule thresholds to assign a
+  criticality level, which gates whether (and to whom) an email alert is sent.
+- **Incremental or full-table validation** — each registered object can be validated on a rolling
+  time window (daily/monthly/yearly/custom interval) or as a full-table scan, tracked via an
+  execution-status table in BigQuery.
+- **Event-driven or on-demand** — a Cloud Function can trigger validation automatically on GCS file
+  upload; Cloud SQL and BigQuery jobs are submitted manually or on a schedule.
 
 ---
 
@@ -70,6 +105,12 @@ Failures above a configured threshold trigger email alerts via SendGrid.
               │  • object_log           │
               │  • execution_status     │
               └─────────────────────────┘
+
+              ┌─────────────────────────────────────────────────────┐
+              │  rule_intelligence/  (separate, local, optional)      │
+              │  sample data / contract → Gemini → review YAML        │
+              │  → human review → MySQL metadata tables (above)       │
+              └─────────────────────────────────────────────────────┘
 ```
 
 **Supported data sources**
@@ -80,6 +121,9 @@ Failures above a configured threshold trigger email alerts via SendGrid.
 | Cloud SQL (MySQL) | `cloudsql` | Manual / scheduled |
 | BigQuery table | `bigquery` | Manual / scheduled |
 
+All metadata — rules, object registrations, thresholds, and notification routing — lives in a single
+MySQL database, independent of which data source is being validated.
+
 ---
 
 ## Project Structure
@@ -88,28 +132,36 @@ Failures above a configured threshold trigger email alerts via SendGrid.
 data-validation-framework/
 │
 ├── README.md
+├── CLAUDE.md                                 # Architecture notes for AI coding assistants
 ├── requirements.txt                          # Dataproc runtime dependencies
-├── pyproject.toml                            # Package metadata
+├── pyproject.toml                            # Package metadata + optional dependency groups
 │
 ├── config/
-│   └── data_validation.conf                  # Framework configuration (key=value)
+│   └── data_validation.conf.example          # Template — copy to data_validation.conf (git-ignored)
 │
-├── data_validation/                          # Main Python package
+├── data_validation/                          # Main Python package (runs on Dataproc)
 │   ├── __init__.py
 │   ├── main.py                               # Spark entry point & job orchestrator
 │   │
 │   ├── connectors/
-│   │   ├── __init__.py
 │   │   └── source_extract.py                 # Data loaders: BigQuery, Cloud SQL, GCS
 │   │
 │   ├── validators/
-│   │   ├── __init__.py
 │   │   ├── business.py                       # SQL push-down business rule engine
 │   │   └── custodial.py                      # Schema / data-quality validation tests
 │   │
-│   └── notifications/
-│       ├── __init__.py
-│       └── mailer.py                         # SendGrid email alert dispatcher
+│   ├── notifications/
+│   │   └── mailer.py                         # SendGrid email alert dispatcher
+│   │
+│   └── rule_intelligence/                    # Optional local CLI — no pyspark/BigQuery dependency
+│       ├── cli.py                            # dv-rules-generate / dv-rules-apply entry points
+│       ├── profiling.py                      # Pandas-based sample data profiler
+│       ├── contract.py                       # Data contract document loader
+│       ├── schema.py                         # Pydantic schema for LLM structured output
+│       ├── llm.py                            # LangChain + Gemini wrapper
+│       ├── review_yaml.py                    # Human-review YAML (de)serialization
+│       ├── db_writer.py                      # Writes reviewed rules to the metadata DB
+│       └── config.py                         # Config file loading for the apply step
 │
 ├── cloud_functions/
 │   └── gcs_trigger/
@@ -123,20 +175,132 @@ data-validation-framework/
 │   └── dml/
 │       ├── 01_seed_rules.sql                 # Sample validation rules (custodial + business)
 │       ├── 02_seed_objects.sql               # Sample source object registrations
-│       ├── 03_seed_mappings.sql              # Sample rule-to-object mappings
-│       ├── 04_seed_thresholds.sql            # Criticality thresholds per mapping
-│       └── 05_seed_notifications.sql         # Email notification config
+│       ├── 03_seed_mappings.sql               # Sample rule-to-object mappings
+│       ├── 04_seed_thresholds.sql             # Criticality thresholds per mapping
+│       └── 05_seed_notifications.sql          # Email notification config
 │
 └── tests/
-    └── __init__.py                           # Placeholder for unit tests
+    └── __init__.py                            # Placeholder for unit tests
 ```
+
+---
+
+## Prerequisites
+
+| Requirement | Version |
+|---|---|
+| Python | 3.10+ |
+| Apache Spark (Dataproc) | 2.x / 3.x |
+| Google Cloud SDK (`gcloud`, `gsutil`, `bq`) | Latest |
+| GCP services | BigQuery, Cloud Storage, Dataproc, Cloud Functions |
+| MySQL (Cloud SQL) | 5.7+ — stores validation metadata |
+| Gemini API key | Only if using [AI-Assisted Rule Generation](#ai-assisted-rule-generation) |
+
+---
+
+## Quick Start
+
+```bash
+# 1. Clone and install the base package (for local editing/import resolution;
+#    PySpark itself is provided by the Dataproc cluster at job runtime)
+git clone <this-repo-url>
+cd data-validation-framework
+pip install -e .
+
+# 2. Bootstrap the MySQL metadata schema
+mysql -h <cloud_sql_ip> -u root -p < sql/ddl/00_create_database.sql
+mysql -h <cloud_sql_ip> -u root -p Data_Validation < sql/ddl/01_create_tables.sql
+mysql -h <cloud_sql_ip> -u root -p Data_Validation < sql/dml/01_seed_rules.sql   # + 02..05, optional
+
+# 3. Configure and upload the runtime conf file
+cp config/data_validation.conf.example config/data_validation.conf
+# edit config/data_validation.conf with real values, then:
+gsutil cp config/data_validation.conf gs://<your-bucket>/validation_framework/config/data_validation.conf
+
+# 4. Package and upload the job, then submit it to Dataproc
+zip -r data_validation.zip data_validation/
+gsutil cp data_validation.zip gs://<your-bucket>/validation_framework/scripts/data_validation.zip
+gsutil cp data_validation/main.py gs://<your-bucket>/validation_framework/scripts/main.py
+
+CONF_FILE_GCS=gs://<your-bucket>/validation_framework/config/data_validation.conf \
+gcloud dataproc jobs submit pyspark \
+    gs://<your-bucket>/validation_framework/scripts/main.py \
+    --cluster=data-validation --region=<region> \
+    --py-files=gs://<your-bucket>/validation_framework/scripts/data_validation.zip \
+    --jars=gs://hadoop-lib/bigquery/bigquery-connector-hadoop2-latest.jar \
+    -- bigquery <object_id> <job_id> <db_name>
+```
+
+See [Database Setup](#database-setup), [Configuration](#configuration), and
+[Deployment](#deployment) below for the full picture, including the GCS-triggered Cloud Function path.
+
+---
+
+## Configuration
+
+Copy `config/data_validation.conf.example` to `config/data_validation.conf` (git-ignored) and fill in
+real values. The framework downloads this file from GCS at runtime — path given via the
+`CONF_FILE_GCS` env var. Each line uses `key=value` format.
+
+```ini
+# MySQL metadata database
+user=<db_user>
+pswd=<db_password>         # Prefer the DB_PASSWORD env var instead — see below
+hostip=<cloud_sql_ip>
+hport=3306
+database=Data_Validation
+
+# GCP project
+project=<gcp_project_id>
+
+# BigQuery dataset
+dataset_id=<bq_dataset>
+table_name=data_validation_rule
+
+# Output tables (within dataset_id)
+output_table=data_validation_detailed_error_result
+output_agg_table=data_validation_aggregated_error_result
+obj_log_table=data_validation_object_log
+execution_stat_table=validation_execution
+
+# GCS staging directory (bucket name only, no gs://)
+output_dir=<gcs_bucket_name>
+```
+
+Upload to GCS before running:
+
+```bash
+gsutil cp config/data_validation.conf \
+    gs://<your-bucket>/validation_framework/config/data_validation.conf
+```
+
+`config/data_validation.conf` is git-ignored — never commit a filled-in copy of it. See
+[Security Considerations](#security-considerations).
+
+---
+
+## Environment Variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `CONF_FILE_GCS` | Yes | GCS path to the uploaded `.conf` file, e.g. `gs://<bucket>/validation_framework/config/data_validation.conf` |
+| `SENDGRID_API_KEY` | Yes (for email alerts) | SendGrid API key for SMTP auth |
+| `NOTIFICATION_SENDER` | No | Sender email address (default: `noreply@example.com`) |
+| `DB_PASSWORD` | Recommended | Overrides `pswd` in the conf file — keep real passwords out of the conf file where possible |
+| `ALLOW_CUSTOM_SPARK_EXEC` | No | Set to `1` to enable the `custom_spark` rule type, which `exec()`s Python code stored in the rule metadata. **Disabled by default** — only enable with a trusted, access-controlled metadata database |
+| `GCP_PROJECT` | Cloud Function only | GCP project ID |
+| `SCRIPTS_BUCKET` | Cloud Function only | GCS bucket/prefix holding `main.py` and `data_validation.zip` |
+| `VALIDATION_DATASETS` | Cloud Function only | Comma-separated BigQuery datasets to scan for validated tables |
+| `OUTPUT_DATASET` / `OUTPUT_TABLE` / `OUTPUT_DIR` | Cloud Function only | Where the submitted Dataproc job writes its output |
+| `DATAPROC_CLUSTER` | Cloud Function only | Name of the Dataproc cluster to submit jobs to |
+| `GOOGLE_API_KEY` | Only for `rule_intelligence` | Gemini API key (Google AI Studio), used solely by `dv-rules-generate` |
 
 ---
 
 ## Database Setup
 
-All validation metadata is stored in a MySQL database (Cloud SQL).  The `sql/`
-folder contains the complete DDL and sample DML to bootstrap the schema.
+All validation metadata is stored in a MySQL database (Cloud SQL). The `sql/` folder contains the
+complete DDL and sample DML needed to bootstrap the schema.
 
 ### Folder layout
 
@@ -146,11 +310,11 @@ sql/
 │   ├── 00_create_database.sql   # Create the Data_Validation database
 │   └── 01_create_tables.sql     # All 8 metadata tables in dependency order
 └── dml/
-    ├── 01_seed_rules.sql        # Sample validation rules (all rule types)
-    ├── 02_seed_objects.sql      # Sample source object registrations
-    ├── 03_seed_mappings.sql     # Rule → object mappings
-    ├── 04_seed_thresholds.sql   # Criticality thresholds per mapping
-    └── 05_seed_notifications.sql# Email alert configuration
+    ├── 01_seed_rules.sql         # Sample validation rules (all rule types)
+    ├── 02_seed_objects.sql       # Sample source object registrations
+    ├── 03_seed_mappings.sql      # Rule → object mappings
+    ├── 04_seed_thresholds.sql    # Criticality thresholds per mapping
+    └── 05_seed_notifications.sql # Email alert configuration
 ```
 
 ### Metadata tables
@@ -189,75 +353,6 @@ mysql -h $HOST -u $USER -p $DB < sql/dml/05_seed_notifications.sql
 
 ---
 
-## Prerequisites
-
-| Requirement | Version |
-|---|---|
-| Python | 3.8+ |
-| Apache Spark (Dataproc) | 2.x / 3.x |
-| Google Cloud SDK (`gcloud`, `gsutil`, `bq`) | Latest |
-| GCP services | BigQuery, Cloud Storage, Dataproc, Cloud Functions |
-| MySQL (Cloud SQL) | 5.7+ — stores validation metadata |
-
----
-
-## Configuration
-
-Copy `config/data_validation.conf.example` to `config/data_validation.conf` (git-ignored) and fill in
-real values. The framework downloads this file from GCS at runtime — path given via the
-`CONF_FILE_GCS` env var. Each line uses `key=value` format.
-
-```ini
-# MySQL metadata database
-user=<db_user>
-pswd=<db_password>         # ⚠ Move to DB_PASSWORD env var in production
-hostip=<cloud_sql_ip>
-hport=3306
-database=Data_Validation
-
-# GCP project
-project=<gcp_project_id>
-
-# BigQuery dataset
-dataset_id=<bq_dataset>
-table_name=data_validation_rule
-
-# Output tables (within dataset_id)
-output_table=data_validation_detailed_error_result
-output_agg_table=data_validation_aggregated_error_result
-obj_log_table=data_validation_object_log
-execution_stat_table=validation_execution
-
-# GCS staging directory (bucket name only, no gs://)
-output_dir=<gcs_bucket_name>
-```
-
-Upload to GCS before running:
-
-```bash
-gsutil cp config/data_validation.conf \
-    gs://<your-bucket>/validation_framework/config/data_validation.conf
-```
-
----
-
-## Environment Variables
-
-| Variable | Required | Description |
-|---|---|---|
-| `CONF_FILE_GCS` | Yes | GCS path to the uploaded `.conf` file, e.g. `gs://<bucket>/validation_framework/config/data_validation.conf` |
-| `SENDGRID_API_KEY` | Yes (for email alerts) | SendGrid API key for SMTP auth |
-| `NOTIFICATION_SENDER` | No | Sender email address (default: `noreply@example.com`) |
-| `DB_PASSWORD` | Recommended | Overrides `pswd` in the conf file |
-| `ALLOW_CUSTOM_SPARK_EXEC` | No | Set to `1` to enable the `custom_spark` rule type, which `exec()`s Python code stored in the rule metadata. Disabled by default — only enable with a trusted, access-controlled metadata database |
-| `GCP_PROJECT` | Cloud Function only | GCP project ID |
-| `SCRIPTS_BUCKET` | Cloud Function only | GCS bucket/prefix holding `main.py` and `data_validation.zip` |
-| `VALIDATION_DATASETS` | Cloud Function only | Comma-separated BigQuery datasets to scan for validated tables |
-| `OUTPUT_DATASET` / `OUTPUT_TABLE` / `OUTPUT_DIR` | Cloud Function only | Where the submitted Dataproc job writes its output |
-| `DATAPROC_CLUSTER` | Cloud Function only | Name of the Dataproc cluster to submit jobs to |
-
----
-
 ## Deployment
 
 ### 1 — Package the Python source
@@ -277,6 +372,8 @@ gsutil cp data_validation/main.py \
 ```
 
 ### 2 — Deploy the Cloud Function
+
+Only needed if you want validation to trigger automatically on GCS file upload.
 
 ```bash
 gcloud functions deploy hello_gcs \
@@ -326,7 +423,8 @@ gcloud dataproc jobs submit pyspark \
 
 ## Validation Rule Types
 
-Rules are stored in the MySQL metadata database and referenced by `Rule_Logic` (JSON).
+Rules are stored in the MySQL metadata database and referenced by `Rule_Logic` (JSON for custodial
+rules, raw SQL for business rules).
 
 ### Custodial rules (schema / data-quality)
 
@@ -345,11 +443,12 @@ Rules are stored in the MySQL metadata database and referenced by `Rule_Logic` (
 | `max_date: "<date>"` | Fails if date is later than the maximum |
 | `data_type: "<BQ_type>"` | Fails if inferred Spark type is incompatible |
 | `custom_sql: "<SQL>"` | Executes a custom SQL query against a Spark view |
-| `custom_spark: "<code>"` | ⚠ Executes arbitrary Spark code — use with caution |
+| `custom_spark: "<code>"` | Executes arbitrary Python via `exec()`. **Disabled unless `ALLOW_CUSTOM_SPARK_EXEC=1`** — see [Security Considerations](#security-considerations) |
 
 ### Business rules
 
-Business rules use complete SQL statements stored in `Rule_Logic`. The framework pushes them directly to BigQuery and counts the resulting failure rows.
+Business rules use complete SQL statements stored in `Rule_Logic`. The framework pushes them directly
+to BigQuery and counts the resulting failure rows — no data passes through Spark for this rule type.
 
 ---
 
@@ -403,20 +502,27 @@ Email alerts are sent when the failure rate for a rule exceeds its configured cr
 
 ---
 
-## AI-Assisted Rule Generation
+## 🤖 AI-Assisted Rule Generation
 
-`data_validation/rule_intelligence/` is an optional, local CLI tool (never run on Dataproc) that uses
-Gemini via LangChain to propose candidate validation rules from a sample data file and/or a freeform
-data-contract document, subject to human review before anything is written to the metadata database.
+`data_validation/rule_intelligence/` is an optional, **local-only** CLI tool — it never runs on
+Dataproc and has no import-time dependency on `pyspark` or BigQuery. It uses Gemini (via LangChain) to
+propose candidate validation rules from a sample data file and/or a freeform data-contract document.
+Nothing reaches the metadata database without an explicit human review step.
 
-Install the extra dependencies:
+```
+sample data (CSV/JSON)  ─┐
+                         ├─→ Gemini (structured output) ─→ review YAML ─→ human review ─→ MySQL
+data contract (.md/.txt)─┘
+```
+
+### Setup
 
 ```bash
 pip install -e ".[rule-intelligence]"
 export GOOGLE_API_KEY=<your Gemini API key from https://aistudio.google.com/apikey>
 ```
 
-**1. Generate candidate rules** from a sample CSV/JSON file and (optionally) a data-contract document:
+### 1. Generate candidate rules
 
 ```bash
 dv-rules-generate \
@@ -427,34 +533,60 @@ dv-rules-generate \
     --out review/account_rules.yaml
 ```
 
-This profiles the sample data with pandas, sends the profile (and contract text, if given) to Gemini,
-and writes a `review/account_rules.yaml` file — one entry per proposed rule, each with `include: true`,
-a `rule_logic` mapping, a confidence score, and a rationale.
+This profiles the sample data with pandas (null rates, distinct counts, min/max, string lengths,
+email/date heuristics), sends that profile — plus the contract text, if supplied — to Gemini, and
+writes `review/account_rules.yaml`: one entry per proposed rule, each with `include: true`, a
+`rule_logic` mapping, a confidence score, and a rationale.
 
-**2. Review the YAML by hand.** Toggle `include: false` to reject a rule, edit `rule_description` or
-`rule_logic`, or delete entries outright. Nothing is written to the database until step 3.
+### 2. Review the YAML by hand
 
-**3. Apply the reviewed rules** to the MySQL metadata tables:
+Toggle `include: false` to reject a rule, edit `rule_description` or `rule_logic`, or delete entries
+outright. **Nothing is written to the database until step 3.**
+
+### 3. Apply the reviewed rules
 
 ```bash
 dv-rules-apply --review-file review/account_rules.yaml --conf config/data_validation.conf
 ```
 
-This writes (in FK order) `data_validation_object_lookup` → `data_validation_rule` →
-`data_validation_rule_mapping` → `data_validation_rule_threshold`, inside a single transaction, and
-skips rule mappings that already exist (re-running `apply` on the same file is safe; pass `--force` to
-bypass this). Use `--dry-run` to preview the planned inserts without connecting to the database.
+This writes, in foreign-key order, `data_validation_object_lookup` → `data_validation_rule` →
+`data_validation_rule_mapping` → `data_validation_rule_threshold`, inside a single transaction. Rule
+mappings that already exist are skipped (re-running `apply` on the same file is safe); pass `--force`
+to bypass that check. Use `--dry-run` to preview the planned inserts without opening a database
+connection.
 
-Notes:
+### Design notes
+
 - The LLM can only propose rules from the existing `Rule_Logic` vocabulary (`is_nullable`, `distinct`,
   `regex`, `allowed`, `forbidden`, `min`, `max`, `min_length`, `max_length`, `min_date`, `max_date`,
-  `data_type`, `custom_sql`, or a business SQL statement). It can never generate a `custom_spark`
-  rule — that type is not a valid value in the underlying schema, so it cannot be produced even via a
-  maliciously-crafted contract document.
+  `data_type`, `custom_sql`, or a business SQL statement). It can **never** generate a `custom_spark`
+  rule — that value doesn't exist in the underlying schema, so it can't be produced even via a
+  maliciously-crafted data-contract document (prompt injection).
 - Business rules (raw SQL) are not syntax-checked against BigQuery by this tool — review them more
   carefully than custodial rules, since errors only surface at actual validation run time.
-- This subpackage has no import-time dependency on `pyspark`/BigQuery; it's independent of the
-  Dataproc job's runtime requirements.
+- Uses the Gemini API via Google AI Studio (`GOOGLE_API_KEY`), not Vertex AI — no GCP service-account
+  setup is required to run this locally.
+
+---
+
+## Security Considerations
+
+- **Never commit real credentials.** `config/data_validation.conf` is git-ignored; only
+  `config/data_validation.conf.example` (placeholder values) should be committed. Prefer the
+  `DB_PASSWORD` environment variable or Google Secret Manager over storing a password in the conf
+  file at all.
+- **`custom_spark` rules are disabled by default.** They execute arbitrary Python via `exec()` against
+  code stored in the `Rule_Logic` column. Only set `ALLOW_CUSTOM_SPARK_EXEC=1` if the MySQL metadata
+  database is a trusted, access-controlled system — anyone who can write a rule row can otherwise run
+  arbitrary code on your Spark cluster. Prefer `custom_sql` (Spark SQL, not `exec()`) wherever possible.
+- **SQL is parameterized.** MySQL metadata queries in `data_validation/main.py` and
+  `rule_intelligence/db_writer.py` use `%s` placeholders rather than string interpolation.
+- **`rule_intelligence` output still needs review.** Business rules generated from sample data or a
+  contract document are not validated against a live BigQuery schema before being written — treat
+  Gemini's suggestions as a draft, not a guarantee of correctness.
+
+If you discover a security issue, please open an issue (or use your repository host's private
+vulnerability reporting feature, if enabled) rather than filing a public PR with exploit details.
 
 ---
 
@@ -465,4 +597,11 @@ Notes:
 3. Add or update tests in `tests/` for any new logic that does not require a live Spark cluster.
 4. Open a pull request with a clear description of the change.
 
-> **Security note**: Never commit credentials, API keys, or IP addresses to this repository. Use environment variables or Google Secret Manager for all sensitive values.
+> **Security note**: Never commit credentials, API keys, or IP addresses to this repository. Use
+> environment variables or Google Secret Manager for all sensitive values.
+
+## License
+
+No license file is currently included in this repository. Until one is added, all rights are reserved
+by default — add a `LICENSE` file (e.g. Apache-2.0 or MIT) before accepting external use or
+contributions under an open-source license.
