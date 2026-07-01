@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "data-validation-framework"
+version = "1.0.0"
+description = "GCP data validation framework running on Dataproc/PySpark"
+requires-python = ">=3.8"
+dependencies = [
+    "mysql-connector-python>=8.0",
+    "pandas>=1.5",
+    "tabulate>=0.9",
+    "google-cloud-bigquery>=3.0",
+    "google-cloud-storage>=2.0",
+]
+
+[project.scripts]
+data-validate = "data_validation.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["data_validation*"]

@@ -1,0 +1,13 @@
+user=<db_user>
+pswd=<db_password>
+hostip=<cloud_sql_ip>
+hport=3306
+database=Data_Validation
+project=<gcp_project_id>
+table_name=data_validation_rule
+dataset_id=<bq_dataset>
+output_dir=<gcs_bucket_name>
+output_table=data_validation_detailed_error_result
+output_agg_table=data_validation_aggregated_error_result
+obj_log_table=data_validation_object_log
+execution_stat_table=validation_execution

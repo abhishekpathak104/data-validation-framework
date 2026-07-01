@@ -1,0 +1,4 @@
+# Cloud Function dependencies (lighter subset — no PySpark)
+google-cloud-bigquery>=3.0,<4.0
+google-cloud-storage>=2.0,<3.0
+google-cloud-dataproc>=5.0,<6.0

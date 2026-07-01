@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Local runtime config — copy from data_validation.conf.example and fill in real values.
+config/data_validation.conf
+
+data_validation.zip
+validation_errors.csv
+.DS_Store
